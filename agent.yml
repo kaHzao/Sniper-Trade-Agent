@@ -1,0 +1,84 @@
+name: Kazao Alpha Agent
+
+on:
+  schedule:
+    # Run every hour
+    - cron: '0 * * * *'
+    # Also run callback handler every 15 minutes
+    - cron: '*/15 * * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  monitor-tweets:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 * * * *' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore seen IDs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_ids.json
+          key: seen-ids-${{ github.run_id }}
+          restore-keys: seen-ids-
+
+      - name: Run tweet monitor agent
+        env:
+          TWITTERAPI_KEY:       ${{ secrets.TWITTERAPI_KEY }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python agent.py
+
+      - name: Save seen IDs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_ids.json
+          key: seen-ids-${{ github.run_id }}
+
+  handle-callbacks:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore pending tweets cache
+        uses: actions/cache@v4
+        with:
+          path: pending_tweets.json
+          key: pending-tweets-${{ github.run_id }}
+          restore-keys: pending-tweets-
+
+      - name: Process Telegram callbacks
+        env:
+          TWITTERAPI_KEY:       ${{ secrets.TWITTERAPI_KEY }}
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python callback_handler.py
+
+      - name: Save pending tweets cache
+        uses: actions/cache@v4
+        with:
+          path: pending_tweets.json
+          key: pending-tweets-${{ github.run_id }}
