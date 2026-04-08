@@ -35,11 +35,13 @@ interface Candle {
 // ─── Fetch OHLCV ──────────────────────────────────────────────────────────────
 
 async function fetchOHLCV(asset: Asset, tf: '15m' | '1h', limit = 100): Promise<Candle[]> {
-  const endpoint  = 'histominute';
-  const aggregate = tf === '15m' ? 15 : 60;
+  // histominute: max aggregate 30 — pakai untuk 15m
+  // histohour: pakai untuk 1h (aggregate=1)
+  const endpoint  = tf === '15m' ? 'histominute' : 'histohour';
+  const aggregate = tf === '15m' ? 15 : 1;
 
   const { data } = await axios.get(
-    'https://min-api.cryptocompare.com/data/histominute',
+    `https://min-api.cryptocompare.com/data/${endpoint}`,
     {
       params:  { fsym: asset, tsym: 'USD', limit, aggregate, extraParams: 'sniper-agent' },
       headers: { 'User-Agent': 'Mozilla/5.0' },
