@@ -2,7 +2,7 @@ name: Sniper Trading Agent
 
 on:
   schedule:
-    - cron: '*/45 * * * *'   # setiap 45 menit — lebih jarang dari Claude/GPT
+    - cron: '*/8 * * * *'   # setiap 45 menit — lebih jarang dari Claude/GPT
   workflow_dispatch:
 
 jobs:
