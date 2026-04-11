@@ -1,4 +1,3 @@
-import axios from 'axios';
 import { EMA, RSI, ATR } from 'technicalindicators';
 import { config, type Asset, ASSETS } from '../utils/config';
 import { logger } from '../utils/logger';
@@ -21,10 +20,9 @@ export interface TAResult {
   slPct:        number;
   tpPct:        number;
   rrRatio:      number;
-  // Sniper-specific
-  crossAge:     number;   // berapa candle lalu cross terjadi
-  volumeRatio:  number;   // volume candle ini vs avg
-  atrPct:       number;   // ATR% untuk transparency
+  crossAge:     number;
+  volumeRatio:  number;
+  atrPct:       number;
 }
 
 interface Candle {
@@ -32,28 +30,41 @@ interface Candle {
   close: number; volume: number;
 }
 
-// ─── Fetch OHLCV ──────────────────────────────────────────────────────────────
+// ─── OKX symbol map ───────────────────────────────────────────────────────────
+
+const OKX_SYMBOL: Record<string, string> = {
+  SOL:  'SOL-USDT',
+  BTC:  'BTC-USDT',
+  WBTC: 'BTC-USDT',
+  ETH:  'ETH-USDT',
+};
+
+// ─── Fetch OHLCV dari OKX ─────────────────────────────────────────────────────
 
 async function fetchOHLCV(asset: Asset, tf: '15m' | '1h', limit = 100): Promise<Candle[]> {
-  // histominute: max aggregate 30 — pakai untuk 15m
-  // histohour: pakai untuk 1h (aggregate=1)
-  const endpoint  = tf === '15m' ? 'histominute' : 'histohour';
-  const aggregate = tf === '15m' ? 15 : 1;
+  const instId = OKX_SYMBOL[asset];
+  if (!instId) throw new Error(`Unknown asset: ${asset}`);
 
-  const { data } = await axios.get(
-    `https://min-api.cryptocompare.com/data/${endpoint}`,
-    {
-      params:  { fsym: asset, tsym: 'USD', limit, aggregate, extraParams: 'sniper-agent' },
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      timeout: 15_000,
-    }
-  );
+  const bar = tf === '15m' ? '15m' : '1H';
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${limit + 1}`;
 
-  if (data.Response === 'Error') throw new Error(data.Message);
-  return (data.Data || []).map((k: any) => ({
-    open: k.open, high: k.high, low: k.low,
-    close: k.close, volume: k.volumeto,
-  }));
+  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+  if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
+
+  const json = await res.json() as any;
+  if (json.code !== '0') throw new Error(`OKX error: ${json.msg}`);
+
+  // OKX: terbaru → terlama, reverse + buang candle live
+  return (json.data as string[][])
+    .reverse()
+    .slice(0, -1)
+    .map(k => ({
+      open:   parseFloat(k[1]),
+      high:   parseFloat(k[2]),
+      low:    parseFloat(k[3]),
+      close:  parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }));
 }
 
 // ─── EMA values ───────────────────────────────────────────────────────────────
@@ -66,9 +77,6 @@ function getEMAValues(candles: Candle[]): { fast: number[]; slow: number[] } {
 }
 
 // ─── Fresh EMA cross detection ────────────────────────────────────────────────
-// Core logic sniper agent: cari EMA cross yang BARU terjadi
-// Cross = fast line melewati slow line dalam N candle terakhir
-// Return: { crossed: bool, direction: 'UP'|'DOWN', age: candle berapa lalu }
 
 function detectFreshCross(
   fast: number[], slow: number[]
@@ -77,21 +85,17 @@ function detectFreshCross(
     return { crossed: false, direction: 'UP', age: 99 };
   }
 
-  // Cek N candle terakhir untuk fresh cross
   for (let age = 1; age <= config.ta.crossLookback; age++) {
     const idx     = fast.length - 1 - age;
     const idxPrev = idx - 1;
-
     if (idxPrev < 0) continue;
 
     const currFast = fast[idx];     const currSlow = slow[idx];
     const prevFast = fast[idxPrev]; const prevSlow = slow[idxPrev];
 
-    // Bullish cross: fast melewati slow dari bawah ke atas
     if (prevFast <= prevSlow && currFast > currSlow) {
       return { crossed: true, direction: 'UP', age };
     }
-    // Bearish cross: fast melewati slow dari atas ke bawah
     if (prevFast >= prevSlow && currFast < currSlow) {
       return { crossed: true, direction: 'DOWN', age };
     }
@@ -129,14 +133,6 @@ function getVolumeRatio(candles: Candle[]): number {
 }
 
 // ─── Confidence score ─────────────────────────────────────────────────────────
-// Max 100:
-//   Fresh cross (age=1)    : 35 pts
-//   Fresh cross (age=2)    : 25 pts
-//   Fresh cross (age=3)    : 15 pts
-//   RSI dalam momentum zone: 25 pts
-//   Volume spike ≥ 2×      : 25 pts
-//   Volume spike ≥ 1.5×    : 15 pts
-//   ATR cukup besar        : 15 pts
 
 function calcConfidence(
   crossAge:    number,
@@ -147,12 +143,10 @@ function calcConfidence(
 ): number {
   let score = 0;
 
-  // Cross freshness
   if      (crossAge === 1) score += 35;
   else if (crossAge === 2) score += 25;
   else if (crossAge === 3) score += 15;
 
-  // RSI momentum zone
   const isLong = signal === 'LONG';
   const rsiOk  = isLong
     ? (rsi >= config.ta.rsiBuyMin  && rsi <= config.ta.rsiBuyMax)
@@ -160,12 +154,10 @@ function calcConfidence(
   if (rsiOk) score += 25;
   else if (isLong ? (rsi >= 45 && rsi <= 75) : (rsi >= 25 && rsi <= 55)) score += 10;
 
-  // Volume spike
   if      (volumeRatio >= config.ta.volumeSpike) score += 25;
   else if (volumeRatio >= 1.5)                   score += 15;
   else if (volumeRatio >= 1.2)                   score += 5;
 
-  // ATR cukup besar
   if (atrPct >= config.ta.atrMinPct) score += 15;
   else if (atrPct >= config.ta.atrMinPct * 0.7) score += 5;
 
@@ -178,9 +170,8 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
   try {
     logger.info(`Analyzing ${asset}...`);
 
-    // Fetch 1h untuk bias + ATR, 15m untuk entry timing
     const c1h  = await fetchOHLCV(asset, '1h',  80);
-    await new Promise(r => setTimeout(r, 800));
+    await new Promise(r => setTimeout(r, 500));
     const c15m = await fetchOHLCV(asset, '15m', 60);
 
     if (c1h.length < 30 || c15m.length < 25) {
@@ -190,31 +181,24 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
 
     const price = c15m[c15m.length - 1].close;
 
-    // ── ATR dari 1h (SL/TP sizing) ──────────────────────────────────────────
     const atr1h  = getATR(c1h);
     const atrPct = atr1h / price;
 
-    // ATR minimum filter — tidak entry kalau market terlalu sepi
     if (atrPct < config.ta.atrMinPct * 0.5) {
-      const reason = `ATR terlalu kecil (${(atrPct*100).toFixed(3)}% < ${(config.ta.atrMinPct*50).toFixed(3)}%) — market sepi`;
+      const reason = `ATR terlalu kecil (${(atrPct*100).toFixed(3)}%) — market sepi`;
       logger.info(`${asset} → HOLD | ${reason}`);
       return makeHold(asset, reason, price, 0, 0, 0);
     }
 
-    // ── EMA cross detection dari 1h ──────────────────────────────────────────
     const { fast: fast1h, slow: slow1h } = getEMAValues(c1h);
     const cross = detectFreshCross(fast1h, slow1h);
 
-    // Current EMA position (untuk trend bias)
     const currFast = fast1h[fast1h.length - 1];
     const currSlow = slow1h[slow1h.length - 1];
     const trend1h: 'BULLISH' | 'BEARISH' | 'NEUTRAL' =
       currFast > currSlow ? 'BULLISH' : currFast < currSlow ? 'BEARISH' : 'NEUTRAL';
 
-    // ── RSI dari 15m (momentum timing) ──────────────────────────────────────
-    const rsi = getRSI(c15m);
-
-    // ── Volume ratio dari 15m ────────────────────────────────────────────────
+    const rsi         = getRSI(c15m);
     const volumeRatio = getVolumeRatio(c15m);
 
     logger.info(
@@ -222,49 +206,39 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       `trend:${trend1h} | RSI:${rsi.toFixed(1)} | vol:${volumeRatio.toFixed(2)}x | ATR:${(atrPct*100).toFixed(3)}%`
     );
 
-    // ── Signal logic ─────────────────────────────────────────────────────────
-    // Syarat entry:
-    // 1. Ada fresh EMA cross dalam crossLookback candle
-    // 2. Cross direction sesuai dengan signal
-    // 3. RSI dalam momentum zone yang sesuai
-    // 4. Volume spike konfirmasi
-
     let signal: Signal = 'HOLD';
     let reason = '';
 
     if (!cross.crossed) {
       reason = `No fresh EMA cross dalam ${config.ta.crossLookback} candle terakhir`;
     } else if (cross.direction === 'UP') {
-      // Bullish cross
       if (trend1h !== 'BULLISH') {
         reason = `Bullish cross tapi trend 1h masih ${trend1h}`;
       } else if (rsi < config.ta.rsiBuyMin - 5) {
-        reason = `Bullish cross tapi RSI terlalu rendah (${rsi.toFixed(1)}) — momentum belum ada`;
+        reason = `Bullish cross tapi RSI terlalu rendah (${rsi.toFixed(1)})`;
       } else if (rsi > config.ta.rsiBuyMax + 5) {
         reason = `Bullish cross tapi RSI overbought (${rsi.toFixed(1)})`;
       } else if (volumeRatio < 1.2) {
-        reason = `Bullish cross tapi volume lemah (${volumeRatio.toFixed(2)}x < 1.2x)`;
+        reason = `Bullish cross tapi volume lemah (${volumeRatio.toFixed(2)}x)`;
       } else {
         signal = 'LONG';
         reason = `Fresh bullish cross (age:${cross.age}) | RSI:${rsi.toFixed(1)} | vol:${volumeRatio.toFixed(2)}x | ATR:${(atrPct*100).toFixed(3)}%`;
       }
     } else {
-      // Bearish cross
       if (trend1h !== 'BEARISH') {
         reason = `Bearish cross tapi trend 1h masih ${trend1h}`;
       } else if (rsi > config.ta.rsiShortMax + 5) {
         reason = `Bearish cross tapi RSI terlalu tinggi (${rsi.toFixed(1)})`;
       } else if (rsi < config.ta.rsiShortMin - 5) {
-        reason = `Bearish cross tapi RSI oversold (${rsi.toFixed(1)}) — tunggu bounce`;
+        reason = `Bearish cross tapi RSI oversold (${rsi.toFixed(1)})`;
       } else if (volumeRatio < 1.2) {
-        reason = `Bearish cross tapi volume lemah (${volumeRatio.toFixed(2)}x < 1.2x)`;
+        reason = `Bearish cross tapi volume lemah (${volumeRatio.toFixed(2)}x)`;
       } else {
         signal = 'SHORT';
         reason = `Fresh bearish cross (age:${cross.age}) | RSI:${rsi.toFixed(1)} | vol:${volumeRatio.toFixed(2)}x | ATR:${(atrPct*100).toFixed(3)}%`;
       }
     }
 
-    // ── Confidence ────────────────────────────────────────────────────────────
     const confidence = signal !== 'HOLD'
       ? calcConfidence(cross.age, rsi, signal, volumeRatio, atrPct)
       : 0;
@@ -280,7 +254,6 @@ export async function analyzeAsset(asset: Asset): Promise<TAResult | null> {
       return makeHold(asset, reason, price, rsi, volumeRatio, atrPct, trend1h, confidence);
     }
 
-    // ── SL/TP dari ATR 1h ────────────────────────────────────────────────────
     const slDist = atr1h * config.ta.atrMultiplier;
     const tpDist = atr1h * config.ta.atrTpMultiplier;
 
